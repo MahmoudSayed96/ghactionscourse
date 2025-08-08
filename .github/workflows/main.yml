@@ -12,4 +12,10 @@ jobs:
     steps:
       - name: Print Welcome Message
         run: echo "Welcome from first job for GitHub Actions"
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4.2.2
+
+      - name: List Files
+        run: ls -la
     
