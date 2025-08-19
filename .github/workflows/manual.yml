@@ -5,7 +5,7 @@ on:
         description: "Choose Environment"
         required: true
         default: "development"
-        type: choose
+        type: choice
         options:
           - development
           - stage
