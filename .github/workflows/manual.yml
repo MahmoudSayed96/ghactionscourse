@@ -1,0 +1,10 @@
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    run: ubuntu-latest
+    steps:
+      - name: Deployment On Dev
+        run: echo 'Deployment start....'
+    
