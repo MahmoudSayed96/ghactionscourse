@@ -1,3 +1,5 @@
+name: Application Deployment
+
 on:
   workflow_dispatch:
     inputs:
@@ -10,11 +12,501 @@ on:
           - development
           - stage
           - production
+env:
+  PHP_VERSION: '8.2'
+  NODE_VERSION: '18.x'
 
 jobs:
-  deploy:
+  # Test and Build
+  test-and-build:
     runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: laravel_test
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+      redis:
+        image: redis:7.0
+        ports:
+          - 6379:6379
+        options: --health-cmd="redis-cli ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      deploy-url: ${{ steps.set-env.outputs.deploy-url }}
+
     steps:
-      - name: Deployment On Dev
-        run: echo 'Deployment start....'
-    
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set environment variables
+      id: set-env
+      run: |
+        if [[ ${{ inputs.environment }} == 'production' ]]; then
+          echo "environment=production" >> $GITHUB_OUTPUT
+          echo "deploy-url=${{ secrets.PROD_SERVER_URL }}" >> $GITHUB_OUTPUT
+        elif [[ ${{ inputs.environment }} == 'stage' ]]; then
+          echo "environment=staging" >> $GITHUB_OUTPUT
+          echo "deploy-url=${{ secrets.STAGING_SERVER_URL }}" >> $GITHUB_OUTPUT
+        elif [[ ${{ inputs.environment }} == 'development' ]]; then
+          echo "environment=development" >> $GITHUB_OUTPUT
+          echo "deploy-url=${{ secrets.DEV_SERVER_URL }}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ env.PHP_VERSION }}
+        extensions: mbstring, dom, fileinfo, mysql, redis
+        coverage: xdebug
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Cache Composer packages
+      uses: actions/cache@v4
+      with:
+        path: vendor
+        key: ${{ runner.os }}-php-${{ hashFiles('**/composer.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-php-
+
+    - name: Install Composer dependencies
+      run: composer install --no-progress --prefer-dist --optimize-autoloader
+
+    - name: Install NPM dependencies
+      run: npm ci
+
+    - name: Copy environment file
+      run: cp .env.testing .env
+
+    - name: Generate application key
+      run: php artisan key:generate
+
+    - name: Clear config cache
+      run: php artisan config:clear
+
+    - name: Run database migrations
+      run: php artisan migrate --force
+      env:
+        DB_CONNECTION: mysql
+        DB_HOST: 127.0.0.1
+        DB_PORT: 3306
+        DB_DATABASE: laravel_test
+        DB_USERNAME: root
+        DB_PASSWORD: root
+
+    - name: Run database seeders
+      run: php artisan db:seed --force
+
+    - name: Run PHPUnit tests
+      run: vendor/bin/phpunit --coverage-text --coverage-clover=coverage.xml
+
+    - name: Run Laravel Pint (Code Style)
+      run: vendor/bin/pint --test
+
+    - name: Build frontend assets
+      run: npm run build
+
+    - name: Upload test coverage
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        flags: laravel
+
+    - name: Create deployment package
+      run: |
+        mkdir -p deployment
+        cp -r app deployment/
+        cp -r bootstrap deployment/
+        cp -r config deployment/
+        cp -r database deployment/
+        cp -r public deployment/
+        cp -r resources deployment/
+        cp -r routes deployment/
+        cp -r storage deployment/
+        cp -r vendor deployment/
+        cp composer.json deployment/
+        cp composer.lock deployment/
+        cp artisan deployment/
+        cp .env.example deployment/
+        tar -czf laravel-${{ github.sha }}.tar.gz deployment/
+
+    - name: Upload deployment package
+      uses: actions/upload-artifact@v4
+      with:
+        name: laravel-package-${{ github.sha }}
+        path: laravel-${{ github.sha }}.tar.gz
+        retention-days: 7
+
+  # Development Deployment
+  deploy-development:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: development
+      url: ${{ secrets.DEV_SERVER_URL }}
+
+    steps:
+    - name: Download deployment package
+      uses: actions/download-artifact@v4
+      with:
+        name: laravel-package-${{ github.sha }}
+
+    - name: Deploy to Development Server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.DEV_SERVER_HOST }}
+        username: ${{ secrets.DEV_SERVER_USER }}
+        key: ${{ secrets.DEV_SERVER_SSH_KEY }}
+        port: ${{ secrets.DEV_SERVER_PORT || 22 }}
+        script: |
+          cd ${{ secrets.DEV_DEPLOY_PATH }}
+
+          # Download and extract
+          wget ${{ secrets.ARTIFACT_DOWNLOAD_URL }}/laravel-${{ github.sha }}.tar.gz || echo "Using local file transfer"
+
+          # Backup current version
+          if [ -d "current" ]; then
+            cp -r current backup-$(date +%Y%m%d-%H%M%S)
+          fi
+
+          # Extract new version
+          tar -xzf laravel-${{ github.sha }}.tar.gz
+          rm -rf current
+          mv deployment current
+          cd current
+
+          # Setup Laravel environment
+          cp .env.dev .env || cp .env.example .env
+
+          # Install/update dependencies (production only)
+          composer install --no-dev --optimize-autoloader
+
+          # Set proper permissions
+          chmod -R 755 storage bootstrap/cache
+          chown -R www-data:www-data storage bootstrap/cache
+
+          # Clear and cache Laravel configurations
+          php artisan config:clear
+          php artisan cache:clear
+          php artisan view:clear
+          php artisan route:clear
+
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+
+          # Run migrations
+          php artisan migrate --force
+
+          # Restart services
+          sudo systemctl reload php8.2-fpm
+          sudo systemctl reload nginx
+
+    - name: Health Check
+      run: |
+        sleep 30
+        response=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.DEV_SERVER_URL }}/health)
+        if [ $response != "200" ]; then
+          echo "Health check failed with status: $response"
+          exit 1
+        fi
+        echo "Development deployment successful!"
+
+  # Staging Deployment
+  deploy-staging:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/staging' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: ${{ secrets.STAGING_SERVER_URL }}
+
+    steps:
+    - name: Download deployment package
+      uses: actions/download-artifact@v4
+      with:
+        name: laravel-package-${{ github.sha }}
+
+    - name: Deploy to Staging Server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.STAGING_SERVER_HOST }}
+        username: ${{ secrets.STAGING_SERVER_USER }}
+        key: ${{ secrets.STAGING_SERVER_SSH_KEY }}
+        port: ${{ secrets.STAGING_SERVER_PORT || 22 }}
+        script: |
+          cd ${{ secrets.STAGING_DEPLOY_PATH }}
+
+          # Create backup
+          if [ -d "current" ]; then
+            cp -r current backup-$(date +%Y%m%d-%H%M%S)
+          fi
+
+          # Extract new version
+          tar -xzf laravel-${{ github.sha }}.tar.gz
+          rm -rf current
+          mv deployment current
+          cd current
+
+          # Setup environment
+          cp .env.staging .env
+
+          # Install dependencies
+          composer install --no-dev --optimize-autoloader
+
+          # Set permissions
+          chmod -R 755 storage bootstrap/cache
+          chown -R www-data:www-data storage bootstrap/cache
+
+          # Laravel optimizations
+          php artisan config:clear
+          php artisan cache:clear
+          php artisan view:clear
+          php artisan route:clear
+
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+
+          # Database operations
+          php artisan migrate --force
+          php artisan db:seed --class=ProductionSeeder --force
+
+          # Queue and scheduler
+          php artisan queue:restart
+
+          # Restart services
+          sudo systemctl reload php8.2-fpm
+          sudo systemctl reload nginx
+
+    - name: Run Integration Tests
+      run: |
+        sleep 30
+        # Basic health checks
+        curl -f ${{ secrets.STAGING_SERVER_URL }}/health
+        curl -f ${{ secrets.STAGING_SERVER_URL }}/api/status
+
+        # You can add more API endpoint tests here
+        echo "Staging deployment verified!"
+
+    - name: Slack Notification
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        message: |
+          Laravel Staging Deployment: ${{ job.status }}
+          Branch: ${{ github.ref }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+          URL: ${{ secrets.STAGING_SERVER_URL }}
+
+  # Production Deployment (Manual Approval Required)
+  deploy-production:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: ${{ secrets.PROD_SERVER_URL }}
+
+    steps:
+    - name: Download deployment package
+      uses: actions/download-artifact@v4
+      with:
+        name: laravel-package-${{ github.sha }}
+
+    - name: Deploy to Production Server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.PROD_SERVER_HOST }}
+        username: ${{ secrets.PROD_SERVER_USER }}
+        key: ${{ secrets.PROD_SERVER_SSH_KEY }}
+        port: ${{ secrets.PROD_SERVER_PORT || 22 }}
+        script: |
+          cd ${{ secrets.PROD_DEPLOY_PATH }}
+
+          # Enable maintenance mode
+          if [ -d "current" ]; then
+            cd current && php artisan down --render="errors::503" --retry=60
+            cd ..
+          fi
+
+          # Create timestamped backup
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          if [ -d "current" ]; then
+            cp -r current backup-$timestamp
+          fi
+
+          # Extract and setup new version
+          tar -xzf laravel-${{ github.sha }}.tar.gz
+          rm -rf releases/latest 2>/dev/null || true
+          mv deployment releases/latest
+
+          cd releases/latest
+
+          # Setup production environment
+          cp .env.production .env
+
+          # Install dependencies
+          composer install --no-dev --optimize-autoloader
+
+          # Set permissions
+          chmod -R 755 storage bootstrap/cache
+          chown -R www-data:www-data storage bootstrap/cache
+
+          # Laravel optimizations
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+          php artisan event:cache
+
+          # Database migrations (with backup)
+          php artisan migrate --force
+
+          # Update symlink atomically
+          cd ..
+          ln -sfn releases/latest current-temp
+          mv current-temp current
+
+          cd current
+
+          # Disable maintenance mode
+          php artisan up
+
+          # Restart background services
+          php artisan queue:restart
+          sudo systemctl reload php8.2-fpm
+          sudo systemctl reload nginx
+
+          # Clean old releases (keep last 5)
+          cd ../releases
+          ls -t | tail -n +6 | xargs -r rm -rf
+
+    - name: Post-deployment Tests
+      run: |
+        sleep 60
+
+        # Critical endpoint checks
+        curl -f ${{ secrets.PROD_SERVER_URL }}/health
+        curl -f ${{ secrets.PROD_SERVER_URL }}/api/status
+
+        # Database connectivity check
+        response=$(curl -s ${{ secrets.PROD_SERVER_URL }}/api/db-check)
+        if [[ $response != *"success"* ]]; then
+          echo "Database connectivity check failed"
+          exit 1
+        fi
+
+        echo "Production deployment verified successfully!"
+
+    - name: Production Success Notification
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        channel: '#production-alerts'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        message: |
+          🚀 Laravel Production Deployment Successful!
+
+          Branch: ${{ github.ref }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+          URL: ${{ secrets.PROD_SERVER_URL }}
+
+          All health checks passed ✅
+
+    - name: Production Failure Notification
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        channel: '#production-alerts'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        message: |
+          🚨 Laravel Production Deployment FAILED!
+
+          Branch: ${{ github.ref }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+
+          Manual intervention required. Check logs immediately.
+
+  # Emergency Rollback github.event_name == 'workflow_dispatch'
+  rollback-production:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.environment }} == 'rollback_prod'
+    environment:
+      name: production
+
+    steps:
+    - name: Rollback Production
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.PROD_SERVER_HOST }}
+        username: ${{ secrets.PROD_SERVER_USER }}
+        key: ${{ secrets.PROD_SERVER_SSH_KEY }}
+        script: |
+          cd ${{ secrets.PROD_DEPLOY_PATH }}
+
+          # Enable maintenance mode
+          cd current && php artisan down --retry=60
+          cd ..
+
+          # Find latest backup
+          latest_backup=$(ls -t backup-* | head -1)
+
+          if [ -n "$latest_backup" ]; then
+            # Restore from backup
+            rm -rf current
+            cp -r $latest_backup current
+            cd current
+
+            # Restore Laravel caches
+            php artisan config:cache
+            php artisan route:cache
+            php artisan view:cache
+
+            # Disable maintenance mode
+            php artisan up
+
+            # Restart services
+            php artisan queue:restart
+            sudo systemctl reload php8.2-fpm
+            sudo systemctl reload nginx
+
+            echo "Rollback to $latest_backup completed successfully"
+          else
+            echo "No backup found for rollback"
+            exit 1
+          fi
+
+    - name: Rollback Notification
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#production-alerts'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        message: |
+          ⚠️ Laravel Production Rollback: ${{ job.status }}
+
+          Triggered by: ${{ github.actor }}
+          Time: $(date)
+
+          Please verify application functionality.
