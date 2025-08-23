@@ -15,10 +15,10 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    if: inputs.environment == 'development'
     environment:
       name: development
-     # url: ${{ secrets.DEV_SERVER_URL }}
+      url: ${{ secrets.DEV_SERVER_URL }}
+    if: inputs.environment == 'development'
     steps:
       - name: Move to server
-        run: echo "${{ inputs.environment }}"
+        run: echo "${{ secrets.DEV_SERVER_URL }}"
