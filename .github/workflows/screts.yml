@@ -1,0 +1,11 @@
+name: Try secretes
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Move to server
+        run: echo "${{ secrets.SERVER_URL }}"
