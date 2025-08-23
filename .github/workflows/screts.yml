@@ -6,6 +6,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: development
     steps:
       - name: Move to server
         run: echo "${{ secrets.SERVER_URL }}"
